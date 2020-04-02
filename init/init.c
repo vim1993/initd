@@ -55,6 +55,7 @@ int init_main(int argc, char **argv)
         }
         else if(occurFd < 0)
         {
+            EPrint("epoll_wait occurFd :%d, errno:%d\n", occurFd, errno);
             break;
         }
         
@@ -64,7 +65,7 @@ int init_main(int argc, char **argv)
             {
                 if(gEvent[index].data.fd == propertySock)
                 {
-                    property_service_handler(epollFd);
+                    property_service_handler(epollFd, propertySock);
                 }
             }
         }

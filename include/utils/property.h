@@ -33,7 +33,7 @@ extern int property_set(char * property_name, char * property_val);
 
 typedef struct property_observer_t
 {
-    int (*onPropertyValChange)(char * property_name, char * property_val);
+    int (*onPropertyValChange)(struct property_observer_t * pThis, char * property_name, char * property_val);
 }property_observer_t;
 
 extern int register_property_observer(property_observer_t * observer);
@@ -48,6 +48,10 @@ extern PropertyResolver * getPropertyResolver();
 
 //for release Resolver instance
 extern void releasePropertyResolver();
+
+#ifdef PROPERTY_UNIT_TEST
+extern int property_unit_test_main(int argc, char * argv[]);
+#endif
 
 #ifdef __cplusplus
 }

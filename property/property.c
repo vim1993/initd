@@ -50,7 +50,7 @@ static int property_socket_init(void)
 {
     int fd = INVAILED_SOCKECT_FD;
     struct sockaddr_un serverAddr;
-    char * unixPath = getenv(PROPERTY_SERVICE_ENV);
+    char * unixPath = "/tmp/property_service.unix";
     if(unixPath == NULL || unixPath == "")
     {
         EPrint("get %s failed\n", PROPERTY_SERVICE_ENV);
@@ -77,7 +77,7 @@ static int property_socket_init(void)
     return fd;
 }
 
-static int onPropertyValChange(char * property_name, char * property_val)
+static int onPropertyValChange(struct property_observer_t * pThis, char * property_name, char * property_val)
 {
     IPrint("property_name:%s, property_val:%s\n", property_name, property_val);
 
@@ -104,11 +104,11 @@ static void property_dispatch(ResolverManager_s * manager, property_data_s * pro
         {
             if(observerNode->mObserver->onPropertyValChange)
             {
-                observerNode->mObserver->onPropertyValChange(propertyVal->property_name, propertyVal->property_val);
+                observerNode->mObserver->onPropertyValChange(observerNode->mObserver, propertyVal->property_name, propertyVal->property_val);
             }
             else
             {
-                onPropertyValChange(propertyVal->property_name, propertyVal->property_val);
+                onPropertyValChange(observerNode->mObserver, propertyVal->property_name, propertyVal->property_val);
             }
         }
 
@@ -208,6 +208,8 @@ static void * property_observer_proc(void * param)
         }
     }
 
+    FD_CLR(gObserverManager->mSockfd, &rfds);
+
     return NULL;
 }
 
@@ -227,16 +229,18 @@ static int PropertyResolver_init(ResolverManager_s * manager)
         return fd;
     }
 
+    /*
     property_data_s propertyVal;
+    memset(&propertyVal, 0x0, sizeof(propertyVal));
     propertyVal.action = OBR_ACTION;
-
+    
     iret = TEMP_FAILURE_RETRY(send(fd, &propertyVal, sizeof(property_data_s), 0));
     if(iret < NO_ERR)
     {
         close(fd);
         return SOCKET_SEND_ERR;
     }
-
+    */
     manager->mSockfd = fd;
     if(pthread_create(&tid, NULL, property_observer_proc, (void *)manager) < NO_ERR)
     {
@@ -248,12 +252,13 @@ static int PropertyResolver_init(ResolverManager_s * manager)
 
     if(pthread_create(&dispatch_tid, NULL, property_dispatch_proc, (void *)manager) < NO_ERR)
     {
-        //close(fd);
         EPrint("pthread_create failed\n");
-        //return OS_ERR;
+        manager->mDispatch_tid = 0;
     }
-
-    manager->mDispatch_tid = 0;
+    else
+    {
+        manager->mDispatch_tid = dispatch_tid;
+    }
 
     return NO_ERR;
 }
@@ -293,6 +298,17 @@ static int RegisterObserver(struct PropertyResolver * pThis, char * property_nam
         resolverManager->head = node;
     }
 
+    property_data_s propertyVal;
+    memset(&propertyVal, 0x0, sizeof(propertyVal));
+    propertyVal.action = OBR_ACTION;
+    strcpy(propertyVal.property_name, property_name);
+    
+    int iret = TEMP_FAILURE_RETRY(send(resolverManager->mSockfd, &propertyVal, sizeof(property_data_s), 0));
+    if(iret < NO_ERR)
+    {
+        return SOCKET_SEND_ERR;
+    }
+
     PMUTEX_UNLOCK(resolverManager->glock);
 
     return NO_ERR;
@@ -324,6 +340,11 @@ static int UnRegisterObserver(struct PropertyResolver * pThis, char * property_n
             node = resolverManager->head;
         }
 
+        if(node == NULL)
+        {
+            break;
+        }
+        
         node = node->next;
     }
 
@@ -378,8 +399,11 @@ void releasePropertyResolver()
     {
         gResolverManager->mStopObserver = 1;
         pthread_join(gResolverManager->mTid, NULL);
-        pthread_join(gResolverManager->mDispatch_tid, NULL);
-
+        if(gResolverManager->mDispatch_tid)
+        {
+            pthread_join(gResolverManager->mDispatch_tid, NULL);
+        }
+        
         if(gResolverManager->msgQue)
         {
             DELETE(msgque_obj, gResolverManager->msgQue);
@@ -392,6 +416,11 @@ void releasePropertyResolver()
             free(gResolverManager->head);
             gResolverManager->head = node;
         }
+
+        close(gResolverManager->mSockfd);
+        
+        free(gResolverManager);
+        gResolverManager = NULL;
     }
 }
 
@@ -410,6 +439,7 @@ int property_get(char * property_name, char * property_val, char * default_val)
         return fd;
     }
     property_data_s propertyVal;
+    memset(&propertyVal, 0x0, sizeof(propertyVal));
     propertyVal.action = GET_ACTION;
     strcpy(propertyVal.property_name, property_name);
 
@@ -451,8 +481,10 @@ int property_set(char * property_name, char * property_val)
         return fd;
     }
     property_data_s propertyVal;
-    propertyVal.action = GET_ACTION;
+    propertyVal.action = SET_ACTION;
     strcpy(propertyVal.property_name, property_name);
+    strcpy(propertyVal.property_val, property_val);
+    strcpy(propertyVal.default_val, property_val);
 
     iret = TEMP_FAILURE_RETRY(send(fd, &propertyVal, sizeof(property_data_s), 0));
     if(iret < 0)
@@ -465,3 +497,71 @@ int property_set(char * property_name, char * property_val)
 
     return NO_ERR;
 }
+
+#ifdef PROPERTY_UNIT_TEST
+
+struct property_observer_sub {
+    struct property_observer_t gBaseObserver;
+    char version;
+};
+
+static int onPropertyValChangeSub(struct property_observer_t * pThis, char * property_name, char * property_val)
+{
+    struct property_observer_sub * own = (struct property_observer_sub *)pThis;
+    
+    IPrint("version:%d, property_name:%s, property_val:%s\n", own->version, property_name, property_val);
+
+    return NO_ERR;
+}
+
+int property_unit_test_main(int argc, char * argv[])
+{
+    unsigned sleepCnt = NO_ERR;
+    PropertyResolver * IResolver = getPropertyResolver();
+    if(IResolver == NULL)
+    {
+        DPrint("getPropertyResolver failed\n");
+        return PARAM_ERR;
+    }
+
+    struct property_observer_sub observer;
+    observer.version = 1;
+    observer.gBaseObserver.onPropertyValChange = onPropertyValChangeSub;
+
+    IResolver->RegisterObserver(IResolver, "sys.test", (struct property_observer_t *)&observer);
+
+    int result = NO_ERR;
+    char property_val[VALUE_MAX] = {0};
+    while(1)
+    {
+        sleep(1);
+        if(sleepCnt > 5)
+        {
+            break;
+        }
+
+        if(sleepCnt == 4)
+        {
+            result = property_set("sys.test", "false");
+            DPrint("===>%d,%d<===\n", sleepCnt, result);
+        }
+        else if(sleepCnt == 2)
+        {
+            result = property_get("sys.test", property_val, "false");
+            DPrint("===>%d,%d<===property_val:%s\n", sleepCnt, result, property_val);
+        }
+        else if(sleepCnt == 5)
+        {
+            result = property_get("sys.test", property_val, "false");
+            DPrint("===>%d,%d<===property_val:%s\n", sleepCnt, result, property_val);
+        }
+
+        sleepCnt++;
+    }
+
+    IResolver->UnRegisterObserver(IResolver, "sys.test", (struct property_observer_t *)&observer);
+    releasePropertyResolver();
+
+    return NO_ERR;
+}
+#endif
