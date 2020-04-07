@@ -7,6 +7,7 @@ extern "C" {
 
 extern I32 property_service_init(void);
 extern I32 property_service_handler(int epollfd, int sockfd);
+extern I32 property_service_uninit(void);
 
 #ifdef __cplusplus
 }

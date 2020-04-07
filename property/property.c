@@ -50,7 +50,7 @@ static int property_socket_init(void)
 {
     int fd = INVAILED_SOCKECT_FD;
     struct sockaddr_un serverAddr;
-    char * unixPath = "/tmp/property_service.unix";
+    char * unixPath = getenv(PROPERTY_SERVICE_ENV); //"/tmp/property_service.unix";
     if(unixPath == NULL || unixPath == "")
     {
         EPrint("get %s failed\n", PROPERTY_SERVICE_ENV);
@@ -135,15 +135,17 @@ static void * property_dispatch_proc(void * param)
     property_data_s * propertyVal;
 
     ResolverManager_s * gObserverManager = (ResolverManager_s *) param;
-    while(gObserverManager->mStopObserver)
+    while(!gObserverManager->mStopObserver)
     {
-        propertyVal = gObserverManager->msgQue->pop_front(gObserverManager->msgQue);
+        propertyVal = gObserverManager->msgQue->pop_front_timeout(gObserverManager->msgQue, 1);
         if(propertyVal != NULL)
         {
             property_dispatch(gObserverManager, propertyVal);
             gObserverManager->msgQue->release_buffer(gObserverManager->msgQue, propertyVal);
         }
     }
+
+    IPrint("[%s] pthread exit\n", __func__);
 
     return NULL;
 }
@@ -164,14 +166,19 @@ static void * property_observer_proc(void * param)
 
     ResolverManager_s * gObserverManager = (ResolverManager_s *) param;
     struct timeval timeout;
-    timeout.tv_sec = 2;
-    timeout.tv_usec = 0;
+    
 
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    FD_SET(gObserverManager->mSockfd, &rfds);
-    while(gObserverManager->mStopObserver)
+    fd_set rfds, tfds;
+    FD_ZERO(&tfds);
+    FD_SET(gObserverManager->mSockfd, &tfds);
+    
+    while(!gObserverManager->mStopObserver)
     {
+        
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+        rfds = tfds;
+        
         iret = select(gObserverManager->mSockfd + 1, &rfds, NULL, NULL, &timeout);
         if(iret == 0)
         {
@@ -208,8 +215,11 @@ static void * property_observer_proc(void * param)
         }
     }
 
-    FD_CLR(gObserverManager->mSockfd, &rfds);
+    FD_CLR(gObserverManager->mSockfd, &tfds);
+    FD_ZERO(&tfds);
 
+    IPrint("[%s] pthread exit\n", __func__);
+    
     return NULL;
 }
 
@@ -229,18 +239,6 @@ static int PropertyResolver_init(ResolverManager_s * manager)
         return fd;
     }
 
-    /*
-    property_data_s propertyVal;
-    memset(&propertyVal, 0x0, sizeof(propertyVal));
-    propertyVal.action = OBR_ACTION;
-    
-    iret = TEMP_FAILURE_RETRY(send(fd, &propertyVal, sizeof(property_data_s), 0));
-    if(iret < NO_ERR)
-    {
-        close(fd);
-        return SOCKET_SEND_ERR;
-    }
-    */
     manager->mSockfd = fd;
     if(pthread_create(&tid, NULL, property_observer_proc, (void *)manager) < NO_ERR)
     {
@@ -535,14 +533,14 @@ int property_unit_test_main(int argc, char * argv[])
     while(1)
     {
         sleep(1);
-        if(sleepCnt > 5)
+        if(sleepCnt > 60)
         {
             break;
         }
 
         if(sleepCnt == 4)
         {
-            result = property_set("sys.test", "false");
+            result = property_set("sys.test", "1113");
             DPrint("===>%d,%d<===\n", sleepCnt, result);
         }
         else if(sleepCnt == 2)

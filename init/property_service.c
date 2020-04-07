@@ -50,7 +50,10 @@ typedef struct property_observer_list {
     int sockfd;
     struct lxlist_node node;
     char key[NAME_MAX];
+    
     int (*checkAndSend)(struct property_observer_list * pThis, struct property_data_s * changeProperty);
+
+    void (*release) (struct property_observer_list * pThis);
 }property_observer_list_t;
 
 typedef struct property_manager_s {
@@ -58,8 +61,11 @@ typedef struct property_manager_s {
     lxlist_Obj * gObserverList;
     mutex_lock * glock;
     pthread_t gObserverTid;
+    U8 gStopObserverProc;
 
     msgque_obj * gMsgQue;
+
+    int gSockfd;
     
     property_node_s head;
     lxlist_Obj * gPropertyList;
@@ -130,19 +136,32 @@ static void * property_observer_proc(void * param)
     int sendSize = NO_ERR;
     struct property_handler_s * handler = NULL;
     property_manager_t * manager = (property_manager_t *)param;
-    while(1)
+    while(!gPropertyManager->gStopObserverProc)
     {
-        handler = manager->gMsgQue->pop_front(manager->gMsgQue);
+        handler = manager->gMsgQue->pop_front_timeout(manager->gMsgQue, 2);
         if(handler == NULL)
         {
             continue;
         }
 
-        FUNC_IN();
         handler->handler_callback(handler);
         manager->gMsgQue->release_buffer(manager->gMsgQue, handler);
-        FUNC_OUT();
     }
+
+    return NULL;
+}
+
+static void property_handler_release(struct property_observer_list * pThis)
+{
+    if(pThis == NULL)
+    {
+        return;
+    }
+
+    close(pThis->sockfd);
+    free(pThis);
+
+    return;
 }
 
 static int property_handler_callback(struct property_handler_s * pThis)
@@ -152,12 +171,14 @@ static int property_handler_callback(struct property_handler_s * pThis)
         return PARAM_ERR;
     }
 
-    FUNC_IN();
     int sendSize = NO_ERR;
     property_observer_handler_s * handler = (property_observer_handler_s *)pThis;
     struct property_observer_list * ObserverNode = &gPropertyManager->list;
-    while(1)
+    struct property_observer_list * ObserverNextNode = NULL;
+    
+    while(!gPropertyManager->gStopObserverProc)
     {
+        ObserverNextNode = GET_STRUCT_HEAD_PTR(property_observer_list_t, ObserverNode->node.Next, node);
         if(strcmp(ObserverNode->key, handler->propertyVal.property_name) == 0)
         {
             sendSize = ObserverNode->checkAndSend(ObserverNode, &handler->propertyVal);
@@ -166,17 +187,18 @@ static int property_handler_callback(struct property_handler_s * pThis)
                 PMUTEX_LOCK(gPropertyManager->glock);
                 LXLIST_DEL_NODE(gPropertyManager->gObserverList, &ObserverNode->node);
                 PMUTEX_UNLOCK(gPropertyManager->glock);
+
+                ObserverNode->release(ObserverNode);
+                ObserverNode = NULL;
             }
         }
 
-        ObserverNode = GET_STRUCT_HEAD_PTR(property_observer_list_t, ObserverNode->node.Next, node);
+        ObserverNode = ObserverNextNode;
         if(ObserverNode == NULL || ObserverNode == &gPropertyManager->list)
         {
             break;
         }
     }
-
-    FUNC_OUT();
     
     return NO_ERR;
 }
@@ -191,8 +213,7 @@ static int property_observer_callback(struct property_observer_list * pThis, str
 
     int sendSize = NO_ERR;
 
-    FUNC_IN();
-    IPrint("property_name:%s,%s\n", changeProperty->property_name, pThis->key);
+    //IPrint("property_name:%s,%s, sockfd:%d\n", changeProperty->property_name, pThis->key, pThis->sockfd);
     if(strcmp(changeProperty->property_name, pThis->key) == 0)
     {
         changeProperty->action = OBS_ACTION;
@@ -202,8 +223,9 @@ static int property_observer_callback(struct property_observer_list * pThis, str
             DPrint("send observer failed-->KEY:%s<--\n", pThis->key);
             return SOCKET_SEND_ERR;
         }
+
+        //DPrint("send observer successed-->KEY:%s, fd:%d<--\n", pThis->key, pThis->sockfd);
     }
-    FUNC_OUT();
 
     return NO_ERR;
 }
@@ -219,6 +241,7 @@ static int property_observer_register(int sockfd, const char * key)
     struct property_observer_list * observerNode = observer_query(sockfd, key);
     if(observerNode != NULL)
     {
+        IPrint("find the same observer\n");
         return NO_ERR;
     }
     
@@ -230,9 +253,12 @@ static int property_observer_register(int sockfd, const char * key)
     }
 
     strcpy(observerNode->key, key);
+    observerNode->release = property_handler_release;
     observerNode->checkAndSend = property_observer_callback;
     observerNode->sockfd = sockfd;
     LXLIST_ADD_HEAD(gPropertyManager->gObserverList, &observerNode->node, &gPropertyManager->list.node);
+
+    //IPrint("[%s] -->key:%s<--, sockfd:%d\n", __func__, key, sockfd);
 
     return NO_ERR;
 }
@@ -249,6 +275,11 @@ static I8 property_service_set(struct property_data_s * propertyVal)
 
     if(queryNode != NULL)
     {
+        if(strcmp(queryNode->propertyVal.property_val, propertyVal->property_val) == 0)
+        {
+            return NO_ERR;
+        }
+        
         memcpy(&queryNode->propertyVal, propertyVal, sizeof(struct property_data_s));
     }
     else
@@ -265,7 +296,7 @@ static I8 property_service_set(struct property_data_s * propertyVal)
         LXLIST_ADD_HEAD(gPropertyManager->gPropertyList, &PropertyNode->node, &gPropertyManager->head.node);
     }
 
-    DPrint("key:%s, val:%s\n", propertyVal->property_name, propertyVal->property_val);
+    //DPrint("key:%s, val:%s\n", propertyVal->property_name, propertyVal->property_val);
 
     if(memcmp(propertyVal->property_name, PERSIST_PROPERTY, 8) == 0)
     {
@@ -316,7 +347,7 @@ I32 property_service_init(void)
         return PARAM_ERR;
     }
 
-    DPrint("propertyEnv:%s\n", propertyEnv);
+    //DPrint("propertyEnv:%s\n", propertyEnv);
     if(access(propertyEnv, F_OK) == F_OK)
     {
         unlink(propertyEnv);
@@ -388,7 +419,69 @@ I32 property_service_init(void)
         }
     }
 
+    gPropertyManager->gStopObserverProc = 0;
+    gPropertyManager->gSockfd = sockfd;
+
     return sockfd;
+}
+
+I32 property_service_uninit(void)
+{
+    struct property_node_s * PropertyNode = NULL;
+    struct property_node_s * PropertyNextNode = NULL;
+    struct property_observer_list * ObserverNode = NULL;
+    struct property_observer_list * ObserverNextNode = NULL;
+    
+    if(gPropertyManager)
+    {
+        gPropertyManager->gStopObserverProc = 1;
+        pthread_join(gPropertyManager->gObserverTid, NULL);
+        
+        close(gPropertyManager->gSockfd);
+    
+        if(gPropertyManager->gPropertyList)
+        {
+            PropertyNode = GET_STRUCT_HEAD_PTR(property_node_s, gPropertyManager->head.node.Next, node);
+            while(PropertyNode != NULL && PropertyNode != &gPropertyManager->head)
+            {
+                PropertyNextNode = GET_STRUCT_HEAD_PTR(property_node_s, PropertyNode->node.Next, node);
+                LXLIST_DEL_NODE(gPropertyManager->gObserverList, &PropertyNode->node);
+                free(PropertyNode);
+                
+                PropertyNode = PropertyNextNode;
+            }
+
+            DELETE(lxlist_Obj, gPropertyManager->gPropertyList);
+        }
+
+        if(gPropertyManager->gObserverList)
+        {
+            ObserverNode = GET_STRUCT_HEAD_PTR(property_observer_list_t, gPropertyManager->list.node.Next, node);
+            while(ObserverNode != NULL && ObserverNode != &gPropertyManager->list)
+            {
+                ObserverNextNode = GET_STRUCT_HEAD_PTR(property_observer_list_t, ObserverNode->node.Next, node);
+                LXLIST_DEL_NODE(gPropertyManager->gObserverList, &ObserverNode->node);
+                ObserverNode->release(ObserverNode);
+                
+                ObserverNode = ObserverNextNode;
+            }
+            
+            DELETE(lxlist_Obj, gPropertyManager->gObserverList);
+        }
+
+        if(gPropertyManager->glock)
+        {
+            pthread_resource_lock_delete(gPropertyManager->glock);
+        }
+
+        if(gPropertyManager->gMsgQue)
+        {
+            DELETE(msgque_obj, gPropertyManager->gMsgQue);
+        }
+
+        free(gPropertyManager);
+        gPropertyManager = NULL;
+    } 
 }
 
 I32 property_service_handler(int epollfd, int sockfd)
@@ -417,7 +510,7 @@ I32 property_service_handler(int epollfd, int sockfd)
         return SOCKET_ERR;
     }
 
-    DPrint("action:%d, key:%s, val:%s, def:%s\n", propertyData.action, propertyData.property_name, propertyData.property_val, propertyData.default_val);
+    //DPrint("action:%d, key:%s, val:%s, def:%s\n", propertyData.action, propertyData.property_name, propertyData.property_val, propertyData.default_val);
 
     I8 result = PARAM_ERR;
     switch(propertyData.action)
@@ -436,7 +529,7 @@ I32 property_service_handler(int epollfd, int sockfd)
             break;
     }
 
-    DPrint("key:%s, result:%d\n", propertyData.property_name, result);
+    //DPrint("key:%s, result:%d\n", propertyData.property_name, result);
 
     if(propertyData.action != OBR_ACTION)
     {
